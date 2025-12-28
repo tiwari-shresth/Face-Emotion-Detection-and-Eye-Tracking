@@ -73,15 +73,27 @@ class EmotionGazeTracker:
 
         return frame
 
+import argparse
+
 def main():
+    parser = argparse.ArgumentParser(description="Facial Emotion and Eye Tracking")
+    parser.add_argument("--camera", type=int, default=0, help="Camera index (try 1 for Continuity Camera on Mac)")
+    args = parser.parse_args()
+
     tracker = EmotionGazeTracker()
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(args.camera)
     
     if not cap.isOpened():
-        logger.error("Could not open webcam")
-        return
+        logger.error(f"Could not open camera {args.camera}")
+        if args.camera != 0:
+            print("Falling back to camera 0...")
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                return
+        else:
+            return
 
-    print("Starting video feed. Press 'q' to quit.")
+    print(f"Starting video feed from camera {args.camera}. Press 'q' to quit.")
     
     while True:
         ret, frame = cap.read()
