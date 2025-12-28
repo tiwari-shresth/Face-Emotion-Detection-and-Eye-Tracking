@@ -9,26 +9,51 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class EmotionGazeTracker:
+import threading
+import time
+
+class VideoStream:
+    def __init__(self, src=0):
+        self.stream = cv2.VideoCapture(src)
+        (self.grabbed, self.frame) = self.stream.read()
+        self.stopped = False
+
+    def start(self):
+        threading.Thread(target=self.update, args=(), daemon=True).start()
+        return self
+
+    def update(self):
+        while True:
+            if self.stopped:
+                return
+            (self.grabbed, self.frame) = self.stream.read()
+
+    def read(self):
+        return self.frame
+
+    def stop(self):
+        self.stopped = True
+        self.stream.release()
+
+class EmotionGazeTracker:
     def __init__(self):
-        # Initialize InsightFace for detection and 106-point landmarks
         self.app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
         self.app.prepare(ctx_id=0, det_size=(640, 640))
-        
-        # Initialize HSEmotion for stable, fast emotion recognition
         self.fer = HSEmotionRecognizer(model_name='enet_b0_8_best_vgaf')
         
-        # Performance variables
+        # State & Smoothing
         self.prev_faces = []
         self.frame_count = 0
-        self.skip_frames = 2 # Process every 3rd frame
+        self.skip_frames = 2
+        self.ema_landmarks = {} # For multiple faces, used as cache
+        self.alpha = 0.4 # EMA parameter (0-1), lower is smoother but slower
         
     def process_frame(self, frame):
         self.frame_count += 1
         
-        # Run heavy inference only every skip_frames
+        # Inference frame
         if self.frame_count % (self.skip_frames + 1) == 0 or not self.prev_faces:
             faces = self.app.get(frame)
-            # Pre-calculate emotions for all faces in this inference frame
             for face in faces:
                 try:
                     bbox = face.bbox.astype(int)
@@ -37,39 +62,39 @@ class EmotionGazeTracker:
                         emotion, scores = self.fer.predict_emotions(face_roi)
                         face['emotion'] = emotion
                 except Exception:
-                    face['emotion'] = "Detecting..."
+                    face['emotion'] = "..."
             self.prev_faces = faces
-        
-        # Draw results (either new or cached)
-        for face in self.prev_faces:
-            # 1. Draw Bounding Box
-            bbox = face.bbox.astype(int)
-            cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
-            
-            # 2. Extract Landmarks (106 keypoints)
-            landmarks = face.landmark_2d_106
-            if landmarks is not None:
-                for pt in landmarks.astype(int):
-                    cv2.circle(frame, tuple(pt), 1, (255, 255, 0), -1)
-            
-            # 3. Emotion Display (using cached result)
-            emotion = face.get('emotion', "Analyzing...")
-            cv2.putText(frame, f"Emotion: {emotion}", (bbox[0], bbox[1] - 10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-            # 4. Eye Tracking
+        # Smoothing and Drawing
+        for i, face in enumerate(self.prev_faces):
+            bbox = face.bbox.astype(int)
+            landmarks = face.landmark_2d_106
+            
             if landmarks is not None:
+                # Apply EMA Smoothing to Landmarks
+                if i not in self.ema_landmarks:
+                    self.ema_landmarks[i] = landmarks
+                else:
+                    self.ema_landmarks[i] = self.alpha * landmarks + (1 - self.alpha) * self.ema_landmarks[i]
+                
+                # Draw Smoothed Landmarks
+                curr_landmarks = self.ema_landmarks[i].astype(int)
+                for pt in curr_landmarks:
+                    cv2.circle(frame, tuple(pt), 1, (0, 255, 255), -1, lineType=cv2.LINE_AA)
+                
+                # Eye Tracking on smoothed landmarks
                 left_eye_indices = [35, 41, 42, 39, 37, 36]
                 right_eye_indices = [89, 95, 96, 93, 91, 90]
-                
-                def get_eye_center(indices):
-                    pts = landmarks[indices]
-                    return np.mean(pts, axis=0).astype(int)
+                left_center = np.mean(curr_landmarks[left_eye_indices], axis=0).astype(int)
+                right_center = np.mean(curr_landmarks[right_eye_indices], axis=0).astype(int)
+                cv2.circle(frame, tuple(left_center), 2, (0, 0, 255), -1, lineType=cv2.LINE_AA)
+                cv2.circle(frame, tuple(right_center), 2, (0, 0, 255), -1, lineType=cv2.LINE_AA)
 
-                left_center = get_eye_center(left_eye_indices)
-                right_center = get_eye_center(right_eye_indices)
-                cv2.circle(frame, tuple(left_center), 2, (0, 0, 255), -1)
-                cv2.circle(frame, tuple(right_center), 2, (0, 0, 255), -1)
+            # Draw Bounding Box and Emotion
+            cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 1, lineType=cv2.LINE_AA)
+            emotion = face.get('emotion', "")
+            cv2.putText(frame, f"{emotion}", (bbox[0], bbox[1] - 8), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, lineType=cv2.LINE_AA)
 
         return frame
 
@@ -77,39 +102,34 @@ import argparse
 
 def main():
     parser = argparse.ArgumentParser(description="Facial Emotion and Eye Tracking")
-    parser.add_argument("--camera", type=int, default=0, help="Camera index (try 1 for Continuity Camera on Mac)")
+    parser.add_argument("--camera", type=int, default=0, help="Camera index")
     args = parser.parse_args()
 
     tracker = EmotionGazeTracker()
-    cap = cv2.VideoCapture(args.camera)
+    vs = VideoStream(src=args.camera).start()
     
-    if not cap.isOpened():
-        logger.error(f"Could not open camera {args.camera}")
-        if args.camera != 0:
-            print("Falling back to camera 0...")
-            cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
-                return
-        else:
-            return
+    # Wait for camera to warm up
+    time.sleep(1.0)
 
-    print(f"Starting video feed from camera {args.camera}. Press 'q' to quit.")
+    print(f"Starting optimized stream from camera {args.camera}. Press 'q' to quit.")
     
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        frame = vs.read()
+        if frame is None:
+            continue
+        
+        # Work on a copy to keep original clean if needed
+        display_frame = frame.copy()
         
         # Process frame
-        processed_frame = tracker.process_frame(frame)
+        processed_frame = tracker.process_frame(display_frame)
         
-        # Display the resulting frame
-        cv2.imshow('Emotion and Eye Tracking', processed_frame)
+        cv2.imshow('Emotion and Eye Tracking (Smoothed)', processed_frame)
         
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
             
-    cap.release()
+    vs.stop()
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
